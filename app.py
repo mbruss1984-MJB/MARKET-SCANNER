@@ -10,7 +10,7 @@ from discovery import configured_universe, screen_snapshot
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="0.2.0")
+app = FastAPI(title="Longbridge Ignition Scanner", version="0.3.0")
 lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
          "mode": "watchlist_polling", "trading_enabled": False}
@@ -39,8 +39,8 @@ def fetch_completed(ctx, symbol, period, count):
     return completed
 
 def worker():
-    symbols = configured_universe()
-    update(symbols=symbols)
+    symbols, universe_source = configured_universe()
+    update(symbols=symbols[:20], universe_size=len(symbols), universe_source=universe_source, mode="rotating_universe_polling", alerts_enabled=False)
     if not all(os.getenv(k) for k in ("LONGPORT_APP_KEY", "LONGPORT_APP_SECRET", "LONGPORT_ACCESS_TOKEN")):
         update(error="Missing Longport SDK credentials; scanner is not connected")
         return
@@ -54,6 +54,7 @@ def worker():
         update(error=f"Longport connection failed: {type(exc).__name__}")
         return
     cursor = 0
+    last_candidates = {}
     while True:
         signals = {}
         # Rotate through the configured universe to avoid an unbounded API burst.
@@ -77,7 +78,10 @@ def worker():
             except Exception as exc:
                 log.warning("Market-data fetch failed for %s: %s", symbol, type(exc).__name__)
                 signals[symbol] = {"state": "DATA_ERROR", "error_type": type(exc).__name__}
-        update(signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols))
+        last_candidates.update({s: v for s, v in signals.items() if v.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")})
+        if len(last_candidates) > 100:
+            last_candidates = dict(list(last_candidates.items())[-100:])
+        update(signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates=last_candidates)
         for symbol, result in signals.items():
             if result.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER"):
                 log.warning("PROVISIONAL IGNITION %s %s", symbol, result)
