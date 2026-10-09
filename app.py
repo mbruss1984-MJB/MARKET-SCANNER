@@ -12,12 +12,13 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 from scoring import Bar, analyze
 from tracking import SignalTracker
+from fast_tracking import FastTracker
 from discovery import configured_universe, screen_snapshot
 from pipeline import select_candidates, discover_initial, quote_strength
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="1.3.0")
+app = FastAPI(title="Longbridge Ignition Scanner", version="1.4.0")
 lock = threading.Lock()
 tracker_lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
@@ -158,6 +159,8 @@ def hot_worker():
         log.warning("Hot loop connection failed: %s", type(exc).__name__)
         update(hot_loop_error=type(exc).__name__)
         return
+    fast_tracker = FastTracker(os.getenv("SIGNAL_DB_PATH", "/tmp/ignition_signals.sqlite3"))
+    app.state.fast_tracker = fast_tracker
     history = {}
     streaks = {}
     fast_candidates = {}
@@ -174,6 +177,7 @@ def hot_worker():
                 for snap in snapshots:
                     symbol = str(snap.symbol)
                     price, volume = float(snap.last_done), float(snap.volume)
+                    fast_tracker.observe(symbol, price)
                     trail = history.setdefault(symbol, deque(maxlen=40))
                     while trail and now - trail[0][0] > 180:
                         trail.popleft()
@@ -185,6 +189,8 @@ def hot_worker():
                         vol_delta = max(0, volume - previous[2])
                         momentum_up = change >= 0.25 and vol_delta >= 1000
                         streaks[symbol] = streaks.get(symbol, 0) + 1 if momentum_up else 0
+                        if streaks[symbol] == 2:
+                            fast_tracker.detect(symbol, price)
                         if streaks[symbol] >= 2:
                             fast_candidates[symbol] = {"state": "FAST_MOMENTUM_CANDIDATE", "detected_utc": datetime.now(timezone.utc).isoformat(), "price": price, "price_change_pct": round(change, 3), "volume_delta": vol_delta, "provisional": True, "executable": False}
                         results[symbol] = {"price_change_pct": round(change, 3),
@@ -198,7 +204,7 @@ def hot_worker():
                 fast_candidates = {s: v for s, v in fast_candidates.items() if s in symbols and (datetime.now(timezone.utc) - datetime.fromisoformat(v["detected_utc"])).total_seconds() < 120 and streaks.get(s, 0) >= 2}
                 update(hot_loop_last_utc=datetime.now(timezone.utc).isoformat(),
                        hot_loop_symbols=len(symbols), hot_loop_metrics=results, fast_candidates=fast_candidates.copy(),
-                       fast_candidate_count=len(fast_candidates), hot_loop_error=None, hot_poll_seconds=interval)
+                       fast_candidate_count=len(fast_candidates), fast_signal_summary=fast_tracker.summary(), fast_signal_history=fast_tracker.recent(30), hot_loop_error=None, hot_poll_seconds=interval)
             except Exception as exc:
                 log.warning("Hot loop quote failed: %s", type(exc).__name__)
                 update(hot_loop_error=type(exc).__name__, hot_poll_seconds=interval)
@@ -234,3 +240,16 @@ def signal_export():
     writer.writeheader()
     writer.writerows(rows)
     return Response(output.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=ignition_signals.csv"})
+
+@app.get("/fast-signals.csv")
+def fast_signal_export():
+    tracker = getattr(app.state, "fast_tracker", None)
+    if tracker is None:
+        return Response("fast tracker not initialized", status_code=503)
+    rows = tracker.recent(100000)
+    output = io.StringIO()
+    fields = ["id","symbol","detected_utc","detection_price","latest_price","peak_price","trough_price","peak_gain_pct","max_drawdown_pct","return_1m_pct","return_5m_pct","return_15m_pct","last_observed_utc"]
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+    return Response(output.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=fast_signals.csv"})
