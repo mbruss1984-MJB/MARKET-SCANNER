@@ -11,7 +11,7 @@ from pipeline import select_candidates, discover_initial, quote_strength
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="0.6.0")
+app = FastAPI(title="Longbridge Ignition Scanner", version="0.7.0")
 lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
          "mode": "watchlist_polling", "trading_enabled": False}
@@ -25,11 +25,11 @@ def bar_from_sdk(x):
                close=float(x.close), volume=float(x.volume))
 
 def fetch_completed(ctx, symbol, period, count):
-    from longport.openapi import AdjustType
+    from longport.openapi import AdjustType, Period
     bars = list(ctx.candlesticks(symbol, period, count, AdjustType.NoAdjust))
     bars.sort(key=lambda b: b.timestamp)
     now = datetime.now(timezone.utc)
-    minutes = 1 if str(period).endswith("Min_1") else 5
+    minutes = 1 if period == Period.Min_1 else 5
     completed = []
     for b in bars:
         ts = b.timestamp
@@ -59,6 +59,7 @@ def worker():
     quote_history = {}
     priority = []
     hot_watch = []
+    watch_age = {}
     cycle = 0
     while True:
         signals = {}
@@ -76,20 +77,24 @@ def worker():
             # candidates showing *new* volume and positive price acceleration.
             ranked = select_candidates(snapshots, quote_history, screen_snapshot, limit=12)
             discovered = discover_initial(snapshots, screen_snapshot, limit=16)
-            priority = list(dict.fromkeys([s for _, s, _ in ranked] + discovered + priority))[:24]
+            priority = list(dict.fromkeys([s for _, s, _ in ranked] + discovered))[:24]
             screened = {str(s.symbol) for s in snapshots if screen_snapshot(s)}
             # Keep existing active names, plus promising first-seen movers.
             # Rank on price strength, not turnover alone.
             pool = {str(s.symbol): s for s in snapshots if screen_snapshot(s)}
-            hot_watch = list(dict.fromkeys(discovered + [s for _,s,_ in ranked] + hot_watch))
-            hot_watch = sorted(hot_watch, key=lambda s: quote_strength(pool[s]) if s in pool else -1, reverse=True)[:20]
+            for symbol in discovered + [s for _, s, _ in ranked]:
+                watch_age[symbol] = cycle
+            # Retain active movers for at most 10 cycles without fresh qualification.
+            watch_age = {s: age for s, age in watch_age.items() if cycle - age <= 10}
+            hot_watch = list(dict.fromkeys([s for _, s, _ in ranked] + discovered + list(watch_age)))[:20]
         except Exception as exc:
             log.warning("Quote pre-screen unavailable: %s", type(exc).__name__)
             ranked, screened, discovered = [], set(), []
+            update(last_quote_error=type(exc).__name__)
         # Stage 2: recheck high-priority names, then fetch completed candles.
         # Keep a small bootstrap watchlist active even before two observations.
         bootstrap = [s.strip().upper() for s in os.getenv("SYMBOLS", "WFF.US,VEEA.US,OFAL.US,MRNA.US").split(",") if s.strip()]
-        targets = list(dict.fromkeys(priority[:12] + [s for s in bootstrap if s in screened]))[:16]
+        targets = list(dict.fromkeys([s for _,s,_ in ranked][:8] + discovered[:8] + [s for s in bootstrap if s in screened]))[:16]
         for symbol in targets:
             try:
                 one = fetch_completed(ctx, symbol, Period.Min_1, 15)
@@ -98,10 +103,12 @@ def worker():
             except Exception as exc:
                 log.warning("Market-data fetch failed for %s: %s", symbol, type(exc).__name__)
                 signals[symbol] = {"state": "DATA_ERROR", "error_type": type(exc).__name__}
-        last_candidates.update({s: v for s, v in signals.items() if v.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")})
+        # Current candidates expire when no longer seen; avoid a permanently stale count.
+        last_candidates = {s: (v, cycle) for s, (v, age) in last_candidates.items() if cycle - age <= 10}
+        last_candidates.update({s: (v, cycle) for s, v in signals.items() if v.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")})
         if len(last_candidates) > 100:
             last_candidates = dict(list(last_candidates.items())[-100:])
-        update(signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates=last_candidates, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
+        update(signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates={s: v for s, (v, age) in last_candidates.items()}, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
         for symbol, result in signals.items():
             if result.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER"):
                 log.warning("PROVISIONAL IGNITION %s %s", symbol, result)
