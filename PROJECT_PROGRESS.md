@@ -67,3 +67,19 @@ Detect early U.S. equity price/volume acceleration, including low-priced stocks,
 - Broad candle lifecycle: PICS active early starter at $13.71 (prior PICS event invalidated); QSI prior early starter invalidated. These are a SEPARATE signal ledger from fast events and should not be double-counted.
 - Six detected events is progress, but not six qualified executable trades; performance validation is still insufficient.
 - Note: FRGT's last observation is at 19:41:16 UTC, 5m after detection, illustrating that 15m follow-up may be missing when a ticker leaves hot-watch. Preserve detected symbols for outcome tracking.
+
+
+## Approved future architecture — event-driven AI recommendations (2026-10-09)
+USER'S EXPLICIT END GOAL: The cloud scanner continually looks for outlier ignition events. BOTH the user and an AI analyst are notified of each meaningful event. The AI analyst digests market data, verifies catalyst, liquidity/spread, price structure, and supply/dilution risk, and sends the user a concise reasoned recommendation promptly. Not merely a raw scanner alert or once-hourly ChatGPT summary.
+
+Workflow:
+1. Longbridge continuous rotating universe discovery + 15-second hot-watch monitoring (when hosted process is active).
+2. On qualified new ignition/state upgrade, persist timestamp, ticker, prices, volume, signal evidence and unique event ID; deduplicate.
+3. Fan out the event to the user's immediate SMS/email alert AND a separate cloud AI analysis worker.
+4. Worker retrieves timely quote/bid-ask, spread, liquidity, catalyst/SEC/company news, technical momentum and supply risk, then produces ENTRY READY / WATCH / DO NOT CHASE / REJECT (and INVALIDATED/EXIT WATCH when appropriate), with explanation, entry conditions, maximum chase, invalidation and potential target ONLY when verified.
+5. Deliver the AI summary/recommendation to the user promptly via email initially; add SMS after validation. Update or cancel stale signals if conditions reverse.
+6. Store event, model recommendation, latency, follow-up outcomes and slippage for validation; review from ChatGPT in later conversations.
+
+IMPORTANT LIMITATIONS: The AI worker would be an OpenAI API-powered cloud instance, NOT this exact ChatGPT conversation waking on inbound notifications. ChatGPT scheduled checks can run no more often than hourly. No auto trading. Paid API/SMS/hosting services must not be activated without explicit user approval and budget limits. The user has affirmed saving this plan, but has NOT specified a budget or authorized charging or provisioning paid services. The scanner remains experimental, not an executable recommendation engine.
+
+Next decision: agree on small capped OpenAI API spend vs free-only prototype; design low-cost event-triggered worker, persistent event store, and delivery credentials without committing secrets to public GitHub.
