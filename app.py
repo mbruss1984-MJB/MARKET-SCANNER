@@ -7,10 +7,11 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 from scoring import Bar, analyze
 from discovery import configured_universe, screen_snapshot
+from pipeline import select_candidates
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="0.3.0")
+app = FastAPI(title="Longbridge Ignition Scanner", version="0.4.0")
 lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
          "mode": "watchlist_polling", "trading_enabled": False}
@@ -55,22 +56,29 @@ def worker():
         return
     cursor = 0
     last_candidates = {}
+    quote_history = {}
+    priority = []
     while True:
         signals = {}
         # Rotate through the configured universe to avoid an unbounded API burst.
-        batch_size = max(1, min(40, int(os.getenv("BATCH_SIZE", "20"))))
+        batch_size = max(1, min(100, int(os.getenv("BATCH_SIZE", "20"))))
         batch = [symbols[(cursor + i) % len(symbols)] for i in range(min(batch_size, len(symbols)))] if symbols else []
         cursor = (cursor + len(batch)) % len(symbols) if symbols else 0
         try:
             snapshots = ctx.quote(batch) if batch else []
-            eligible = {str(s.symbol) for s in snapshots if screen_snapshot(s)}
+            # Stage 1: cheap quote snapshots; candle requests are only for
+            # candidates showing *new* volume and positive price acceleration.
+            ranked = select_candidates(snapshots, quote_history, screen_snapshot, limit=12)
+            priority = list(dict.fromkeys([s for _, s, _ in ranked] + priority))[:24]
+            screened = {str(s.symbol) for s in snapshots if screen_snapshot(s)}
         except Exception as exc:
             log.warning("Quote pre-screen unavailable: %s", type(exc).__name__)
-            eligible = set()
-        for symbol in batch:
-            if symbol not in eligible:
-                signals[symbol] = {"state": "FILTERED", "reason": "Missing data, price, volume, or turnover threshold"}
-                continue
+            ranked, screened = [], set()
+        # Stage 2: recheck high-priority names, then fetch completed candles.
+        # Keep a small bootstrap watchlist active even before two observations.
+        bootstrap = symbols[:4]
+        targets = list(dict.fromkeys(priority[:12] + [s for s in bootstrap if s in screened]))[:16]
+        for symbol in targets:
             try:
                 one = fetch_completed(ctx, symbol, Period.Min_1, 15)
                 five = fetch_completed(ctx, symbol, Period.Min_5, 10)
@@ -81,7 +89,7 @@ def worker():
         last_candidates.update({s: v for s, v in signals.items() if v.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")})
         if len(last_candidates) > 100:
             last_candidates = dict(list(last_candidates.items())[-100:])
-        update(signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates=last_candidates)
+        update(signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates=last_candidates, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history))
         for symbol, result in signals.items():
             if result.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER"):
                 log.warning("PROVISIONAL IGNITION %s %s", symbol, result)
