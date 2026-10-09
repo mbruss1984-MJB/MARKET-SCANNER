@@ -7,11 +7,11 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 from scoring import Bar, analyze
 from discovery import configured_universe, screen_snapshot
-from pipeline import select_candidates
+from pipeline import select_candidates, discover_initial, quote_strength
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="0.5.0")
+app = FastAPI(title="Longbridge Ignition Scanner", version="0.6.0")
 lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
          "mode": "watchlist_polling", "trading_enabled": False}
@@ -75,13 +75,17 @@ def worker():
             # Stage 1: cheap quote snapshots; candle requests are only for
             # candidates showing *new* volume and positive price acceleration.
             ranked = select_candidates(snapshots, quote_history, screen_snapshot, limit=12)
-            priority = list(dict.fromkeys([s for _, s, _ in ranked] + priority))[:24]
+            discovered = discover_initial(snapshots, screen_snapshot, limit=16)
+            priority = list(dict.fromkeys([s for _, s, _ in ranked] + discovered + priority))[:24]
             screened = {str(s.symbol) for s in snapshots if screen_snapshot(s)}
-            # Turnover ranks the active watchlist; no claim of market-wide RVOL.
-            hot_watch = [str(s.symbol) for s in sorted(snapshots, key=lambda s: float(getattr(s, "turnover", 0) or 0), reverse=True) if screen_snapshot(s)][:20]
+            # Keep existing active names, plus promising first-seen movers.
+            # Rank on price strength, not turnover alone.
+            pool = {str(s.symbol): s for s in snapshots if screen_snapshot(s)}
+            hot_watch = list(dict.fromkeys(discovered + [s for _,s,_ in ranked] + hot_watch))
+            hot_watch = sorted(hot_watch, key=lambda s: quote_strength(pool[s]) if s in pool else -1, reverse=True)[:20]
         except Exception as exc:
             log.warning("Quote pre-screen unavailable: %s", type(exc).__name__)
-            ranked, screened = [], set()
+            ranked, screened, discovered = [], set(), []
         # Stage 2: recheck high-priority names, then fetch completed candles.
         # Keep a small bootstrap watchlist active even before two observations.
         bootstrap = [s.strip().upper() for s in os.getenv("SYMBOLS", "WFF.US,VEEA.US,OFAL.US,MRNA.US").split(",") if s.strip()]
@@ -97,7 +101,7 @@ def worker():
         last_candidates.update({s: v for s, v in signals.items() if v.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")})
         if len(last_candidates) > 100:
             last_candidates = dict(list(last_candidates.items())[-100:])
-        update(signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates=last_candidates, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
+        update(signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates=last_candidates, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
         for symbol, result in signals.items():
             if result.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER"):
                 log.warning("PROVISIONAL IGNITION %s %s", symbol, result)
