@@ -10,7 +10,7 @@ from discovery import configured_universe, screen_snapshot
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="0.1.0")
+app = FastAPI(title="Longbridge Ignition Scanner", version="0.2.0")
 lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
          "mode": "watchlist_polling", "trading_enabled": False}
