@@ -7,6 +7,7 @@ from fastapi.responses import Response
 import os
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from fastapi import FastAPI
 from scoring import Bar, analyze
@@ -16,7 +17,7 @@ from pipeline import select_candidates, discover_initial, quote_strength
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="1.1.0")
+app = FastAPI(title="Longbridge Ignition Scanner", version="1.2.0")
 lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
          "mode": "watchlist_polling", "trading_enabled": False}
@@ -141,9 +142,58 @@ def worker():
                 log.warning("PROVISIONAL IGNITION %s %s", symbol, result)
         time.sleep(max(60, int(os.getenv("POLL_SECONDS", "60"))))
 
+def hot_worker():
+    """Independent, bounded 15-second hot-watch loop; no trading or alerts."""
+    if not all(os.getenv(k) for k in ("LONGPORT_APP_KEY", "LONGPORT_APP_SECRET", "LONGPORT_ACCESS_TOKEN")):
+        return
+    try:
+        from longport.openapi import Config, QuoteContext
+        ctx = QuoteContext(Config.from_env())
+    except Exception as exc:
+        log.warning("Hot loop connection failed: %s", type(exc).__name__)
+        update(hot_loop_error=type(exc).__name__)
+        return
+    history = {}
+    interval = max(10, min(60, int(os.getenv("HOT_POLL_SECONDS", "15"))))
+    while True:
+        started = time.monotonic()
+        with lock:
+            symbols = list(state.get("hot_watch", []))[:30]
+        if symbols:
+            try:
+                snapshots = ctx.quote(symbols)
+                now = time.monotonic()
+                results = {}
+                for snap in snapshots:
+                    symbol = str(snap.symbol)
+                    price, volume = float(snap.last_done), float(snap.volume)
+                    trail = history.setdefault(symbol, deque(maxlen=40))
+                    while trail and now - trail[0][0] > 180:
+                        trail.popleft()
+                    previous = next((x for x in reversed(trail) if now - x[0] >= 10), None)
+                    trail.append((now, price, volume))
+                    if previous and previous[1] > 0:
+                        seconds = now - previous[0]
+                        change = 100 * (price / previous[1] - 1)
+                        vol_delta = max(0, volume - previous[2])
+                        results[symbol] = {"price_change_pct": round(change, 3),
+                                           "volume_delta": vol_delta,
+                                           "window_seconds": round(seconds, 1),
+                                           "momentum_up": change >= 0.25 and vol_delta > 0,
+                                           "provisional": True, "executable": False}
+                history = {s: h for s, h in history.items() if s in symbols}
+                update(hot_loop_last_utc=datetime.now(timezone.utc).isoformat(),
+                       hot_loop_symbols=len(symbols), hot_loop_metrics=results,
+                       hot_loop_error=None, hot_poll_seconds=interval)
+            except Exception as exc:
+                log.warning("Hot loop quote failed: %s", type(exc).__name__)
+                update(hot_loop_error=type(exc).__name__, hot_poll_seconds=interval)
+        time.sleep(max(1, interval - (time.monotonic() - started)))
+
 @app.on_event("startup")
 def start():
     threading.Thread(target=worker, daemon=True, name="market-scanner").start()
+    threading.Thread(target=hot_worker, daemon=True, name="hot-ignition-loop").start()
 
 @app.get("/")
 def root():
