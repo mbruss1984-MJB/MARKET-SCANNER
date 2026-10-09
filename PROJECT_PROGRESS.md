@@ -56,3 +56,14 @@ Detect early U.S. equity price/volume acceleration, including low-priced stocks,
 - Render service ID: srv-db4h46nlk1mc73813jhg.
 - Most recently verified running code: v1.4.0, commit b632204f59cddf04429e661946c12d13a5fda9fe.
 - Credentials must remain in Render environment variables, never in GitHub files.
+
+
+## Validation checkpoint — 2026-10-09 19:49 UTC (user-provided live status)
+- Connected; no general or hot-loop errors. Broad cycle 16, 69.1% of 5,560-symbol sweep, 20 hot-watch symbols.
+- First SIX fast events recorded; four have 1-minute returns, three have 5-minute returns, zero have 15-minute returns.
+- 5-minute returns: QSI +2.468354%, OFAL +1.741002%, FRGT -0.807018%. These are observed price returns, NOT executable net trading results.
+- Other fast events: PDSB detected $1.37, 1-minute -0.291971%; VEEA detected $5.67, subsequent latest $5.69; WFF detected $11.88, latest $11.88.
+- At snapshot, two active provisional fast candidates: WFF +2.679% / 15 sec with 35,013 additional shares and 2 consecutive qualifying windows; VEEA +0.353% / 15 sec with 1,444 additional shares and 3 qualifying windows.
+- Broad candle lifecycle: PICS active early starter at $13.71 (prior PICS event invalidated); QSI prior early starter invalidated. These are a SEPARATE signal ledger from fast events and should not be double-counted.
+- Six detected events is progress, but not six qualified executable trades; performance validation is still insufficient.
+- Note: FRGT's last observation is at 19:41:16 UTC, 5m after detection, illustrating that 15m follow-up may be missing when a ticker leaves hot-watch. Preserve detected symbols for outcome tracking.
