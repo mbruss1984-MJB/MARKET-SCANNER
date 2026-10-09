@@ -6,12 +6,13 @@ import time
 from datetime import datetime, timezone
 from fastapi import FastAPI
 from scoring import Bar, analyze
+from tracking import SignalTracker
 from discovery import configured_universe, screen_snapshot
 from pipeline import select_candidates, discover_initial, quote_strength
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="0.7.0")
+app = FastAPI(title="Longbridge Ignition Scanner", version="0.8.0")
 lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
          "mode": "watchlist_polling", "trading_enabled": False}
@@ -31,13 +32,15 @@ def fetch_completed(ctx, symbol, period, count):
     now = datetime.now(timezone.utc)
     minutes = 1 if period == Period.Min_1 else 5
     completed = []
+    last_bar_utc = None
     for b in bars:
         ts = b.timestamp
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         if (now - ts.astimezone(timezone.utc)).total_seconds() >= minutes * 60:
             completed.append(bar_from_sdk(b))
-    return completed
+            last_bar_utc = ts.astimezone(timezone.utc).isoformat()
+    return completed, last_bar_utc
 
 def worker():
     symbols, universe_source = configured_universe()
@@ -54,6 +57,7 @@ def worker():
         log.exception("Longport connection failed")
         update(error=f"Longport connection failed: {type(exc).__name__}")
         return
+    tracker = SignalTracker()
     cursor = 0
     last_candidates = {}
     quote_history = {}
@@ -97,18 +101,21 @@ def worker():
         targets = list(dict.fromkeys([s for _,s,_ in ranked][:8] + discovered[:8] + [s for s in bootstrap if s in screened]))[:16]
         for symbol in targets:
             try:
-                one = fetch_completed(ctx, symbol, Period.Min_1, 15)
-                five = fetch_completed(ctx, symbol, Period.Min_5, 10)
+                one, bar_utc = fetch_completed(ctx, symbol, Period.Min_1, 15)
+                five, _ = fetch_completed(ctx, symbol, Period.Min_5, 10)
                 signals[symbol] = analyze(one, five)
+                if one:
+                    tracker.observe(symbol, signals[symbol], one[-1].close, bar_utc)
             except Exception as exc:
                 log.warning("Market-data fetch failed for %s: %s", symbol, type(exc).__name__)
                 signals[symbol] = {"state": "DATA_ERROR", "error_type": type(exc).__name__}
+        tracker.expire()
         # Current candidates expire when no longer seen; avoid a permanently stale count.
         last_candidates = {s: (v, cycle) for s, (v, age) in last_candidates.items() if cycle - age <= 10}
         last_candidates.update({s: (v, cycle) for s, v in signals.items() if v.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")})
         if len(last_candidates) > 100:
             last_candidates = dict(list(last_candidates.items())[-100:])
-        update(signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates={s: v for s, (v, age) in last_candidates.items()}, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
+        update(signal_lifecycle=tracker.summary(), signal_history=tracker.recent(30), signal_storage="ephemeral_sqlite", signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates={s: v for s, (v, age) in last_candidates.items()}, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
         for symbol, result in signals.items():
             if result.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER"):
                 log.warning("PROVISIONAL IGNITION %s %s", symbol, result)
