@@ -11,12 +11,13 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 from scoring import Bar, analyze
 from tracking import SignalTracker
+from screener import discover as screener_discover
 from discovery import configured_universe, screen_snapshot
 from pipeline import select_candidates, discover_initial, quote_strength
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="0.9.0")
+app = FastAPI(title="Longbridge Ignition Scanner", version="1.0.0")
 lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
          "mode": "watchlist_polling", "trading_enabled": False}
@@ -68,6 +69,18 @@ def worker():
     rng = random.Random()
     rng.shuffle(symbols)
     cursor = 0
+    screener_ctx = None
+    screener_symbols = []
+    screener_error = None
+    screener_last_utc = None
+    screener_last_cycle = -999
+    try:
+        from longport.openapi import ScreenerContext
+        screener_ctx = ScreenerContext(config)
+    except Exception as exc:
+        screener_error = type(exc).__name__
+        log.warning("Screener unavailable, retaining rotating fallback: %s", screener_error)
+    allowed_symbols = set(symbols)
     last_candidates = {}
     quote_history = {}
     priority = []
@@ -76,6 +89,17 @@ def worker():
     cycle = 0
     while True:
         signals = {}
+        # Market-wide screener is queried every 5 cycles. Failure is nonfatal.
+        if screener_ctx is not None and cycle - screener_last_cycle >= 5:
+            screener_last_cycle = cycle
+            try:
+                screener_symbols = screener_discover(screener_ctx, allowed_symbols)
+                screener_last_utc = datetime.now(timezone.utc).isoformat()
+                screener_error = None
+            except Exception as exc:
+                screener_error = type(exc).__name__
+                log.warning("Market screener failed; using rotating fallback: %s", screener_error)
+                screener_symbols = []
         # Rotate through the configured universe to avoid an unbounded API burst.
         batch_size = max(1, min(100, int(os.getenv("BATCH_SIZE", "80"))))
         batch = [symbols[(cursor + i) % len(symbols)] for i in range(min(batch_size, len(symbols)))] if symbols else []
@@ -83,8 +107,9 @@ def worker():
         if cursor == 0 and symbols:
             rng.shuffle(symbols)
         # Revisit previously active names every minute while sweeping the rest.
-        revisit = hot_watch[:20]
-        quote_batch = list(dict.fromkeys(revisit + batch))[:100]
+        revisit = hot_watch[:15]
+        # Prioritize broad-market screener hits before slower directory rotation.
+        quote_batch = list(dict.fromkeys(revisit + screener_symbols[:55] + batch))[:100]
         cycle += 1
         try:
             snapshots = ctx.quote(quote_batch) if quote_batch else []
@@ -109,7 +134,7 @@ def worker():
         # Stage 2: recheck high-priority names, then fetch completed candles.
         # Keep a small bootstrap watchlist active even before two observations.
         bootstrap = [s.strip().upper() for s in os.getenv("SYMBOLS", "WFF.US,VEEA.US,OFAL.US,MRNA.US").split(",") if s.strip()]
-        targets = list(dict.fromkeys([s for _,s,_ in ranked][:8] + discovered[:8] + [s for s in bootstrap if s in screened]))[:16]
+        targets = list(dict.fromkeys([s for _,s,_ in ranked][:8] + [s for s in screener_symbols[:20] if s in screened] + discovered[:8] + [s for s in bootstrap if s in screened]))[:16]
         for symbol in targets:
             try:
                 one, bar_utc = fetch_completed(ctx, symbol, Period.Min_1, 15)
@@ -126,7 +151,7 @@ def worker():
         last_candidates.update({s: (v, cycle) for s, v in signals.items() if v.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")})
         if len(last_candidates) > 100:
             last_candidates = dict(list(last_candidates.items())[-100:])
-        update(signal_lifecycle=tracker.summary(), signal_history=tracker.recent(30), signal_storage="ephemeral_sqlite", signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates={s: v for s, (v, age) in last_candidates.items()}, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
+        update(discovery_mode="sdk_screener_plus_rotating_fallback" if screener_ctx else "rotating_fallback", screener_candidates=screener_symbols[:30], screener_candidate_count=len(screener_symbols), screener_last_utc=screener_last_utc, screener_error=screener_error, signal_lifecycle=tracker.summary(), signal_history=tracker.recent(30), signal_storage="ephemeral_sqlite", signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates={s: v for s, (v, age) in last_candidates.items()}, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
         for symbol, result in signals.items():
             if result.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER"):
                 log.warning("PROVISIONAL IGNITION %s %s", symbol, result)
