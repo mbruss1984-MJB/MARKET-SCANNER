@@ -30,6 +30,9 @@ def download_universe(timeout=12):
                 continue
             if row.get("ETF", "N").strip() == "Y":
                 continue
+            name = (row.get("Security Name") or row.get("Company Name") or "").upper()
+            if any(term in name for term in (" WARRANT", " WTS ", " RIGHTS", " UNIT ", " DEPOSITARY", " PREFERRED")):
+                continue
             symbols.append(ticker + ".US")
     if len(set(symbols)) < 1000:
         raise ValueError("Symbol directory unexpectedly small")
@@ -45,11 +48,11 @@ def configured_universe():
     except Exception:
         return fallback, "configured_fallback"
 
-def screen_snapshot(snapshot, *, min_price=0.25, min_turnover=100000):
+def screen_snapshot(snapshot, *, min_price=0.0, min_turnover=100000):
     try:
         last = float(snapshot.last_done)
         volume = float(snapshot.volume)
         turnover = float(snapshot.turnover)
-        return last >= min_price and volume > 0 and turnover >= min_turnover
+        return last > min_price and volume > 0 and turnover >= min_turnover
     except (AttributeError, TypeError, ValueError):
         return False
