@@ -1,5 +1,9 @@
 """Read-only market-data scanner prototype. No brokerage order methods."""
 import logging
+import random
+import csv
+import io
+from fastapi.responses import Response
 import os
 import threading
 import time
@@ -12,7 +16,7 @@ from pipeline import select_candidates, discover_initial, quote_strength
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="0.8.0")
+app = FastAPI(title="Longbridge Ignition Scanner", version="0.9.0")
 lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
          "mode": "watchlist_polling", "trading_enabled": False}
@@ -58,6 +62,11 @@ def worker():
         update(error=f"Longport connection failed: {type(exc).__name__}")
         return
     tracker = SignalTracker()
+    app.state.signal_tracker = tracker
+    # Shuffle sweep order to avoid systematically discovering A-tickers first.
+    # This improves fairness, not the total time required for a full sweep.
+    rng = random.Random()
+    rng.shuffle(symbols)
     cursor = 0
     last_candidates = {}
     quote_history = {}
@@ -71,6 +80,8 @@ def worker():
         batch_size = max(1, min(100, int(os.getenv("BATCH_SIZE", "80"))))
         batch = [symbols[(cursor + i) % len(symbols)] for i in range(min(batch_size, len(symbols)))] if symbols else []
         cursor = (cursor + len(batch)) % len(symbols) if symbols else 0
+        if cursor == 0 and symbols:
+            rng.shuffle(symbols)
         # Revisit previously active names every minute while sweeping the rest.
         revisit = hot_watch[:20]
         quote_batch = list(dict.fromkeys(revisit + batch))[:100]
@@ -137,3 +148,16 @@ def health():
 def status():
     with lock:
         return dict(state)
+
+@app.get("/signals.csv")
+def signal_export():
+    tracker = getattr(app.state, "signal_tracker", None)
+    if tracker is None:
+        return Response("tracker not initialized", status_code=503)
+    rows = tracker.recent(100000)
+    output = io.StringIO()
+    fields = ["id","symbol","detected_utc","last_seen_utc","detection_price","last_price","peak_price","trough_price","peak_gain_pct","max_drawdown_pct","lifecycle","reason","initial_state","last_state","last_bar_utc","observation_count"]
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    writer.writerows(rows)
+    return Response(output.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=ignition_signals.csv"})
