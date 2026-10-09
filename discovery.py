@@ -15,6 +15,18 @@ SOURCES = (
 )
 PATTERN = re.compile(r"^[A-Z]{1,5}$")
 
+EXCLUDED = re.compile(r"\b(WARRANTS?|RIGHTS?|UNITS?|PREFERRED|PREFERENCE|DEPOSITARY|DEPOSITORY|NOTES?|BONDS?|DEBENTURES?|CONVERTIBLE|SUBORDINATED|ETF|ETN)\b", re.I)
+
+def is_common_equity(row):
+    ticker = (row.get("Symbol") or row.get("ACT Symbol") or "").strip().upper()
+    if not PATTERN.fullmatch(ticker):
+        return False
+    for flag in ("Test Issue", "ETF", "NextShares"):
+        if (row.get(flag) or "N").strip().upper() == "Y":
+            return False
+    name = (row.get("Security Name") or row.get("Company Name") or "").strip()
+    return bool(name) and not EXCLUDED.search(name)
+
 def download_universe(timeout=12):
     symbols = []
     for url in SOURCES:
@@ -23,16 +35,9 @@ def download_universe(timeout=12):
             text = response.read(2_000_000).decode("utf-8-sig", "replace")
         rows = csv.DictReader(io.StringIO(text), delimiter="|")
         for row in rows:
+            if not is_common_equity(row):
+                continue
             ticker = (row.get("Symbol") or row.get("ACT Symbol") or "").strip().upper()
-            if not PATTERN.fullmatch(ticker):
-                continue
-            if row.get("Test Issue", "N").strip() == "Y":
-                continue
-            if row.get("ETF", "N").strip() == "Y":
-                continue
-            name = (row.get("Security Name") or row.get("Company Name") or "").upper()
-            if any(term in name for term in (" WARRANT", " WTS ", " RIGHTS", " UNIT ", " DEPOSITARY", " PREFERRED")):
-                continue
             symbols.append(ticker + ".US")
     if len(set(symbols)) < 1000:
         raise ValueError("Symbol directory unexpectedly small")
