@@ -17,8 +17,9 @@ from pipeline import select_candidates, discover_initial, quote_strength
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="1.2.0")
+app = FastAPI(title="Longbridge Ignition Scanner", version="1.3.0")
 lock = threading.Lock()
+tracker_lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
          "mode": "watchlist_polling", "trading_enabled": False}
 
@@ -126,17 +127,21 @@ def worker():
                 five, _ = fetch_completed(ctx, symbol, Period.Min_5, 10)
                 signals[symbol] = analyze(one, five)
                 if one:
-                    tracker.observe(symbol, signals[symbol], one[-1].close, bar_utc)
+                    with tracker_lock:
+                        tracker.observe(symbol, signals[symbol], one[-1].close, bar_utc)
             except Exception as exc:
                 log.warning("Market-data fetch failed for %s: %s", symbol, type(exc).__name__)
                 signals[symbol] = {"state": "DATA_ERROR", "error_type": type(exc).__name__}
-        tracker.expire()
+        with tracker_lock:
+            tracker.expire()
         # Current candidates expire when no longer seen; avoid a permanently stale count.
         last_candidates = {s: (v, cycle) for s, (v, age) in last_candidates.items() if cycle - age <= 10}
         last_candidates.update({s: (v, cycle) for s, v in signals.items() if v.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")})
         if len(last_candidates) > 100:
             last_candidates = dict(list(last_candidates.items())[-100:])
-        update(discovery_mode="multi_batch_quote_discovery", discovery_batches=discovery_batches, screener_candidates=[], screener_candidate_count=0, screener_last_utc=None, screener_error=None, signal_lifecycle=tracker.summary(), signal_history=tracker.recent(30), signal_storage="ephemeral_sqlite", signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates={s: v for s, (v, age) in last_candidates.items()}, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
+        with tracker_lock:
+            lifecycle_snapshot, history_snapshot = tracker.summary(), tracker.recent(30)
+        update(discovery_mode="multi_batch_quote_discovery", discovery_batches=discovery_batches, screener_candidates=[], screener_candidate_count=0, screener_last_utc=None, screener_error=None, signal_lifecycle=lifecycle_snapshot, signal_history=history_snapshot, signal_storage="ephemeral_sqlite", signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates={s: v for s, (v, age) in last_candidates.items()}, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
         for symbol, result in signals.items():
             if result.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER"):
                 log.warning("PROVISIONAL IGNITION %s %s", symbol, result)
@@ -154,6 +159,8 @@ def hot_worker():
         update(hot_loop_error=type(exc).__name__)
         return
     history = {}
+    streaks = {}
+    fast_candidates = {}
     interval = max(10, min(60, int(os.getenv("HOT_POLL_SECONDS", "15"))))
     while True:
         started = time.monotonic()
@@ -176,15 +183,22 @@ def hot_worker():
                         seconds = now - previous[0]
                         change = 100 * (price / previous[1] - 1)
                         vol_delta = max(0, volume - previous[2])
+                        momentum_up = change >= 0.25 and vol_delta >= 1000
+                        streaks[symbol] = streaks.get(symbol, 0) + 1 if momentum_up else 0
+                        if streaks[symbol] >= 2:
+                            fast_candidates[symbol] = {"state": "FAST_MOMENTUM_CANDIDATE", "detected_utc": datetime.now(timezone.utc).isoformat(), "price": price, "price_change_pct": round(change, 3), "volume_delta": vol_delta, "provisional": True, "executable": False}
                         results[symbol] = {"price_change_pct": round(change, 3),
                                            "volume_delta": vol_delta,
                                            "window_seconds": round(seconds, 1),
-                                           "momentum_up": change >= 0.25 and vol_delta > 0,
+                                           "momentum_up": momentum_up,
+                                           "consecutive_windows": streaks[symbol],
                                            "provisional": True, "executable": False}
                 history = {s: h for s, h in history.items() if s in symbols}
+                streaks = {s: n for s, n in streaks.items() if s in symbols}
+                fast_candidates = {s: v for s, v in fast_candidates.items() if s in symbols and (datetime.now(timezone.utc) - datetime.fromisoformat(v["detected_utc"])).total_seconds() < 120 and streaks.get(s, 0) >= 2}
                 update(hot_loop_last_utc=datetime.now(timezone.utc).isoformat(),
-                       hot_loop_symbols=len(symbols), hot_loop_metrics=results,
-                       hot_loop_error=None, hot_poll_seconds=interval)
+                       hot_loop_symbols=len(symbols), hot_loop_metrics=results, fast_candidates=fast_candidates.copy(),
+                       fast_candidate_count=len(fast_candidates), hot_loop_error=None, hot_poll_seconds=interval)
             except Exception as exc:
                 log.warning("Hot loop quote failed: %s", type(exc).__name__)
                 update(hot_loop_error=type(exc).__name__, hot_poll_seconds=interval)
