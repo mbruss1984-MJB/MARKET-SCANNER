@@ -19,7 +19,8 @@ from scanner_mcp import mcp
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="1.4.0")app.mount("/mcp", mcp.streamable_http_app())
+app = FastAPI(title="Longbridge Ignition Scanner", version="1.4.0")
+app.mount("/mcp", mcp.streamable_http_app())
 lock = threading.Lock()
 tracker_lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
