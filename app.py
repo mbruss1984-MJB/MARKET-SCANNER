@@ -123,13 +123,17 @@ class MCPBearerAuth:
             payload = json.dumps({"error": message}).encode()
             headers = [(b"content-type", b"application/json")]
             if status == 401:
-                headers.append((b"www-authenticate", ('Bearer resource_metadata="https://longbridge-ignition-scanner.onrender.com/.well-known/oauth-protected-resource", scope="scanner:read", error="invalid_token", error_description="Authentication required"').encode()))
+                headers.append((b"www-authenticate", ('Bearer realm="Market Scanner", resource_metadata="https://longbridge-ignition-scanner.onrender.com/.well-known/oauth-protected-resource", scope="scanner:read"').encode()))
             await send({"type": "http.response.start", "status": status, "headers": headers})
             await send({"type": "http.response.body", "body": payload})
         if not (MCP_OAUTH_ISSUER and MCP_OAUTH_AUDIENCE and _mcp_jwks):
             return await reject(503, "OAuth provider not configured")
         authorization = next((v.decode("ascii", "replace") for k, v in scope.get("headers", []) if k.lower() == b"authorization"), "")
         if not authorization.startswith("Bearer "):
+            log.warning("MCP OAuth challenge: method=%s path=%s bearer_present=false content_type=%s origin_present=%s",
+                        scope.get("method"), scope.get("path"),
+                        next((v.decode("ascii", "replace") for k, v in scope.get("headers", []) if k.lower() == b"content-type"), ""),
+                        any(k.lower() == b"origin" for k, v in scope.get("headers", [])))
             return await reject(401, "Bearer token required")
         try:
             token = authorization[7:]
