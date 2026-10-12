@@ -29,6 +29,60 @@ async def lifespan(app):
 
 app = FastAPI(title="Longbridge Ignition Scanner", version="1.4.0", lifespan=lifespan)
 app.mount("/mcp", mcp.streamable_http_app())
+# ChatGPT discovery can send a JSON-RPC payload with an octet-stream MIME type.
+# Normalize only validated JSON-RPC requests to the MCP mount, never arbitrary binary.
+class MCPJsonContentTypeCompatibility:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (scope["type"] != "http" or scope.get("method") != "POST"
+                or scope.get("path") not in ("/mcp", "/mcp/")):
+            return await self.app(scope, receive, send)
+        headers = list(scope.get("headers", []))
+        mime = next((v.split(b";", 1)[0].strip().lower()
+                     for k, v in headers if k.lower() == b"content-type"), b"")
+        if mime != b"application/octet-stream":
+            return await self.app(scope, receive, send)
+
+        import json
+        chunks = []
+        size = 0
+        while True:
+            event = await receive()
+            if event["type"] != "http.request":
+                return await self.app(scope, receive, send)
+            chunk = event.get("body", b"")
+            size += len(chunk)
+            if size > 65536:
+                await send({"type": "http.response.start", "status": 413, "headers": []})
+                await send({"type": "http.response.body", "body": b"Payload too large"})
+                return
+            chunks.append(chunk)
+            if not event.get("more_body", False):
+                break
+        body = b"".join(chunks)
+        try:
+            payload = json.loads(body)
+            if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0" or not isinstance(payload.get("method"), str):
+                raise ValueError("Not a JSON-RPC request")
+        except (ValueError, UnicodeDecodeError):
+            await send({"type": "http.response.start", "status": 415, "headers": []})
+            await send({"type": "http.response.body", "body": b"Expected MCP JSON-RPC"})
+            return
+        scope = dict(scope)
+        scope["headers"] = [(k, b"application/json" if k.lower() == b"content-type" else v) for k, v in headers]
+        delivered = False
+        async def replay():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.disconnect"}
+        return await self.app(scope, replay, send)
+
+app.add_middleware(MCPJsonContentTypeCompatibility)
+
 lock = threading.Lock()
 tracker_lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
