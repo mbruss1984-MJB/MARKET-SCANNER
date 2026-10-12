@@ -84,6 +84,67 @@ class MCPJsonContentTypeCompatibility:
 
 app.add_middleware(MCPJsonContentTypeCompatibility)
 
+# OAuth 2.0 protected-resource discovery and JWT verification.
+# Configure MCP_OAUTH_ISSUER, MCP_OAUTH_AUDIENCE and MCP_OAUTH_JWKS_URL
+# in Render. Until configured, MCP access fails closed; scanner routes remain live.
+from fastapi.responses import JSONResponse
+from urllib.parse import urlparse
+import jwt
+from jwt import PyJWKClient
+
+MCP_PUBLIC_URL = "https://longbridge-ignition-scanner.onrender.com/mcp/"
+MCP_OAUTH_ISSUER = os.getenv("MCP_OAUTH_ISSUER", "").rstrip("/")
+MCP_OAUTH_AUDIENCE = os.getenv("MCP_OAUTH_AUDIENCE", "")
+MCP_OAUTH_JWKS_URL = os.getenv("MCP_OAUTH_JWKS_URL", "")
+_mcp_jwks = PyJWKClient(MCP_OAUTH_JWKS_URL, cache_jwk_set=True, lifespan=300) if MCP_OAUTH_JWKS_URL else None
+
+@app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/mcp")
+@app.get("/mcp/.well-known/oauth-protected-resource")
+def mcp_protected_resource_metadata():
+    if not MCP_OAUTH_ISSUER:
+        return JSONResponse({"error": "OAuth provider not configured"}, status_code=503)
+    return {
+        "resource": MCP_PUBLIC_URL,
+        "authorization_servers": [MCP_OAUTH_ISSUER],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": ["scanner:read"],
+    }
+
+class MCPBearerAuth:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path") not in ("/mcp", "/mcp/"):
+            return await self.app(scope, receive, send)
+        async def reject(status, message):
+            import json
+            payload = json.dumps({"error": message}).encode()
+            headers = [(b"content-type", b"application/json")]
+            if status == 401:
+                headers.append((b"www-authenticate", ('Bearer resource_metadata="https://longbridge-ignition-scanner.onrender.com/.well-known/oauth-protected-resource"').encode()))
+            await send({"type": "http.response.start", "status": status, "headers": headers})
+            await send({"type": "http.response.body", "body": payload})
+        if not (MCP_OAUTH_ISSUER and MCP_OAUTH_AUDIENCE and _mcp_jwks):
+            return await reject(503, "OAuth provider not configured")
+        authorization = next((v.decode("ascii", "replace") for k, v in scope.get("headers", []) if k.lower() == b"authorization"), "")
+        if not authorization.startswith("Bearer "):
+            return await reject(401, "Bearer token required")
+        try:
+            token = authorization[7:]
+            key = _mcp_jwks.get_signing_key_from_jwt(token)
+            claims = jwt.decode(token, key.key, algorithms=["RS256"], audience=MCP_OAUTH_AUDIENCE, issuer=MCP_OAUTH_ISSUER, options={"require": ["exp", "iss", "aud"]})
+            scopes = claims.get("scope", "").split()
+            if "scanner:read" not in scopes:
+                return await reject(403, "Missing scanner:read scope")
+        except (jwt.PyJWTError, ValueError, KeyError):
+            return await reject(401, "Invalid bearer token")
+        return await self.app(scope, receive, send)
+
+app.add_middleware(MCPBearerAuth)
+
+
 lock = threading.Lock()
 tracker_lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
