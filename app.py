@@ -15,10 +15,11 @@ from tracking import SignalTracker
 from fast_tracking import FastTracker
 from discovery import configured_universe, screen_snapshot
 from pipeline import select_candidates, discover_initial, quote_strength
+from scanner_mcp import mcp
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="1.4.0")
+app = FastAPI(title="Longbridge Ignition Scanner", version="1.4.0")app.mount("/mcp", mcp.streamable_http_app())
 lock = threading.Lock()
 tracker_lock = threading.Lock()
 state = {"connected": False, "symbols": [], "last_poll_utc": None, "signals": {}, "error": None,
