@@ -66,7 +66,8 @@ class MCPJsonContentTypeCompatibility:
             payload = json.loads(body)
             if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0" or not isinstance(payload.get("method"), str):
                 raise ValueError("Not a JSON-RPC request")
-        except (ValueError, UnicodeDecodeError):
+        except (ValueError, UnicodeDecodeError) as exc:
+            log.warning("MCP discovery rejected: content_type=%s body_bytes=%d parse_error=%s", mime.decode("ascii", "replace"), len(body), type(exc).__name__)
             await send({"type": "http.response.start", "status": 415, "headers": []})
             await send({"type": "http.response.body", "body": b"Expected MCP JSON-RPC"})
             return
