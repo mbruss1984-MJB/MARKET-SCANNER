@@ -1,5 +1,6 @@
 """Read-only market-data scanner prototype. No brokerage order methods."""
 import logging
+from contextlib import asynccontextmanager
 import random
 import csv
 import io
@@ -19,7 +20,14 @@ from scanner_mcp import mcp
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
-app = FastAPI(title="Longbridge Ignition Scanner", version="1.4.0")
+@asynccontextmanager
+async def lifespan(app):
+    async with mcp.session_manager.run():
+        threading.Thread(target=worker, daemon=True, name="market-scanner").start()
+        threading.Thread(target=hot_worker, daemon=True, name="hot-ignition-loop").start()
+        yield
+
+app = FastAPI(title="Longbridge Ignition Scanner", version="1.4.0", lifespan=lifespan)
 app.mount("/mcp", mcp.streamable_http_app())
 lock = threading.Lock()
 tracker_lock = threading.Lock()
@@ -211,11 +219,6 @@ def hot_worker():
                 log.warning("Hot loop quote failed: %s", type(exc).__name__)
                 update(hot_loop_error=type(exc).__name__, hot_poll_seconds=interval)
         time.sleep(max(1, interval - (time.monotonic() - started)))
-
-@app.on_event("startup")
-def start():
-    threading.Thread(target=worker, daemon=True, name="market-scanner").start()
-    threading.Thread(target=hot_worker, daemon=True, name="hot-ignition-loop").start()
 
 @app.get("/")
 def root():
