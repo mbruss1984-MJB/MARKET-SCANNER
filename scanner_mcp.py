@@ -1,7 +1,7 @@
 """Read-only MCP tools for the existing market scanner."""
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("Market Scanner", stateless_http=True, json_response=True, streamable_http_path="/")
+mcp = FastMCP("Market Scanner", stateless_http=True, json_response=True, streamable_http_path="/", host="0.0.0.0", transport_security=None)
 
 @mcp.tool()
 def get_scanner_status() -> dict:
