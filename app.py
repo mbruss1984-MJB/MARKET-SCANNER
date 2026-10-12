@@ -93,7 +93,7 @@ import jwt
 from jwt import PyJWKClient
 
 MCP_PUBLIC_URL = "https://longbridge-ignition-scanner.onrender.com/mcp/"
-MCP_OAUTH_ISSUER = os.getenv("MCP_OAUTH_ISSUER", "").rstrip("/")
+MCP_OAUTH_ISSUER = os.getenv("MCP_OAUTH_ISSUER", "").strip()  # Preserve Auth0 issuer trailing slash exactly
 MCP_OAUTH_AUDIENCE = os.getenv("MCP_OAUTH_AUDIENCE", "")
 MCP_OAUTH_JWKS_URL = os.getenv("MCP_OAUTH_JWKS_URL", "")
 _mcp_jwks = PyJWKClient(MCP_OAUTH_JWKS_URL, cache_jwk_set=True, lifespan=300) if MCP_OAUTH_JWKS_URL else None
@@ -123,7 +123,7 @@ class MCPBearerAuth:
             payload = json.dumps({"error": message}).encode()
             headers = [(b"content-type", b"application/json")]
             if status == 401:
-                headers.append((b"www-authenticate", ('Bearer resource_metadata="https://longbridge-ignition-scanner.onrender.com/.well-known/oauth-protected-resource"').encode()))
+                headers.append((b"www-authenticate", ('Bearer resource_metadata="https://longbridge-ignition-scanner.onrender.com/.well-known/oauth-protected-resource", scope="scanner:read", error="invalid_token", error_description="Authentication required"').encode()))
             await send({"type": "http.response.start", "status": status, "headers": headers})
             await send({"type": "http.response.body", "body": payload})
         if not (MCP_OAUTH_ISSUER and MCP_OAUTH_AUDIENCE and _mcp_jwks):
@@ -135,7 +135,7 @@ class MCPBearerAuth:
             token = authorization[7:]
             key = _mcp_jwks.get_signing_key_from_jwt(token)
             claims = jwt.decode(token, key.key, algorithms=["RS256"], audience=MCP_OAUTH_AUDIENCE, issuer=MCP_OAUTH_ISSUER, options={"require": ["exp", "iss", "aud"]})
-            scopes = claims.get("scope", "").split()
+            scopes = set(claims.get("scope", "").split()) | set(claims.get("permissions", []))
             if "scanner:read" not in scopes:
                 return await reject(403, "Missing scanner:read scope")
         except (jwt.PyJWTError, ValueError, KeyError):
