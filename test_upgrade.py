@@ -39,3 +39,26 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(t.recent()[0]['lifecycle'],'INVALIDATED')
 
 if __name__=='__main__': unittest.main()
+
+class FreshnessTests(unittest.TestCase):
+    def test_stale_and_session_gaps(self):
+        import ast, sys
+        from datetime import timedelta
+        from unittest.mock import patch
+        from pathlib import Path
+        tree=ast.parse(Path('app.py').read_text())
+        function=next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name=='fetch_completed')
+        module=ast.Module(body=[function], type_ignores=[])
+        namespace={'datetime':datetime, 'timezone':timezone, 'bar_from_sdk':lambda b:b}
+        exec(compile(module,'app.py','exec'),namespace)
+        period=SimpleNamespace(Min_1=1,Min_5=5)
+        sdk=SimpleNamespace(AdjustType=SimpleNamespace(NoAdjust=0),Period=period)
+        now=datetime.now(timezone.utc)
+        ctx=lambda bars: SimpleNamespace(candlesticks=lambda *a:bars)
+        with patch.dict(sys.modules,{'longport':SimpleNamespace(), 'longport.openapi':sdk}):
+            bars=[SimpleNamespace(timestamp=now-timedelta(days=1))]
+            self.assertEqual(namespace['fetch_completed'](ctx(bars),'X',1,10),([],None))
+            times=[now-timedelta(minutes=m) for m in [10,9,4,3,2]]
+            bars=[SimpleNamespace(timestamp=t) for t in times]
+            completed,_=namespace['fetch_completed'](ctx(bars),'X',1,10)
+            self.assertEqual(len(completed),3)
