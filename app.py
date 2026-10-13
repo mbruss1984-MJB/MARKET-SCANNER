@@ -260,7 +260,7 @@ def worker():
         # Stage 2: recheck high-priority names, then fetch completed candles.
         # Keep a small bootstrap watchlist active even before two observations.
         bootstrap = [s.strip().upper() for s in os.getenv("SYMBOLS", "WFF.US,VEEA.US,OFAL.US,MRNA.US").split(",") if s.strip()]
-        targets = list(dict.fromkeys([s for _,s,_ in ranked][:8] + discovered[:8] + hot_watch[:8] + [s for s in bootstrap if s in screened]))[:24]
+        targets = list(dict.fromkeys([s for _,s,_ in ranked][:8] + discovered[:8] + discovered[-4:] + hot_watch[:8] + [s for s in bootstrap if s in screened]))[:24]
         for symbol in targets:
             try:
                 one, bar_utc = fetch_completed(ctx, symbol, Period.Min_1, 20)
