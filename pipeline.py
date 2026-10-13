@@ -20,6 +20,7 @@ def quote_strength(quote):
 def select_candidates(snapshots, history, screen, limit=12, now=None):
     now = datetime.now(timezone.utc).timestamp() if now is None else now
     ranked = []
+    rates = history.setdefault("__rates__", {})
     for quote in snapshots:
         symbol = str(quote.symbol)
         if not screen(quote):
@@ -34,14 +35,19 @@ def select_candidates(snapshots, history, screen, limit=12, now=None):
         elapsed = now - old_time
         # Ignore restarts, stale data, nonmonotonic session volume, and old comparisons.
         if elapsed < 15 or elapsed > 900 or volume < old_volume or old_price <= 0:
+            rates.pop(symbol, None)
             continue
         volume_delta = volume - old_volume
         price_pct = 100 * (price / old_price - 1)
         velocity = volume_delta / max(1, elapsed)
-        if price_pct >= 0.1 and volume_delta > 0:
-            score = price_pct * 8 + min(velocity / 100, 20)
+        old_rate = rates.get(symbol)
+        rates[symbol] = velocity
+        buildup = (old_rate is not None and old_rate > 0 and velocity >= old_rate * 1.5
+                   and -0.1 <= price_pct < 0.1 and volume_delta * price >= 10000)
+        if (price_pct >= 0.1 and volume_delta > 0) or buildup:
+            score = price_pct * 8 + min(velocity / 100, 20) + (5 if buildup else 0)
             ranked.append((score, symbol, {"price_change_since_seen_pct":round(price_pct, 3),
-                "volume_since_seen":int(volume_delta), "volume_per_second":round(velocity, 2)}))
+                "buildup_candidate": buildup, "volume_since_seen":int(volume_delta), "volume_per_second":round(velocity, 2)}))
     ranked.sort(reverse=True)
     return ranked[:limit]
 
@@ -49,4 +55,10 @@ def discover_initial(snapshots, screen, limit=16):
     """Provisional day-mover discovery even on first encounter."""
     candidates = [q for q in snapshots if screen(q) and quote_strength(q) >= 6]
     candidates.sort(key=quote_strength, reverse=True)
-    return [str(q.symbol) for q in candidates[:limit]]
+    # Reserve discovery capacity for liquid, quiet names before a day-mover jump.
+    quiet = [q for q in snapshots if screen(q) and q not in candidates]
+    quiet.sort(key=lambda q: _float(getattr(q, "turnover", 0)), reverse=True)
+    mover_slots = max(1, limit * 3 // 4)
+    selected = candidates[:mover_slots] + quiet[:max(0, limit-len(candidates[:mover_slots]))]
+    return [str(q.symbol) for q in selected]
+

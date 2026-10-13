@@ -27,7 +27,7 @@ async def lifespan(app):
         threading.Thread(target=hot_worker, daemon=True, name="hot-ignition-loop").start()
         yield
 
-app = FastAPI(title="Longbridge Ignition Scanner", version="1.4.0", lifespan=lifespan)
+app = FastAPI(title="Longbridge Ignition Scanner", version="1.5.0", lifespan=lifespan)
 app.mount("/mcp", mcp.streamable_http_app())
 # ChatGPT discovery can send a JSON-RPC payload with an octet-stream MIME type.
 # Normalize only validated JSON-RPC requests to the MCP mount, never arbitrary binary.
@@ -170,14 +170,22 @@ def fetch_completed(ctx, symbol, period, count):
     minutes = 1 if period == Period.Min_1 else 5
     completed = []
     last_bar_utc = None
+    timestamps = []
     for b in bars:
         ts = b.timestamp
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         if (now - ts.astimezone(timezone.utc)).total_seconds() >= minutes * 60:
             completed.append(bar_from_sdk(b))
+            timestamps.append(ts.astimezone(timezone.utc))
             last_bar_utc = ts.astimezone(timezone.utc).isoformat()
-    return completed, last_bar_utc
+    # Do not infer fresh ignition from yesterday or gaps between sessions.
+    if not timestamps or (now - timestamps[-1]).total_seconds() > minutes * 180:
+        return [], None
+    start = len(timestamps) - 1
+    while start > 0 and (timestamps[start] - timestamps[start-1]).total_seconds() == minutes * 60:
+        start -= 1
+    return completed[start:], last_bar_utc
 
 def worker():
     symbols, universe_source = configured_universe()
@@ -207,6 +215,7 @@ def worker():
     hot_watch = []
     watch_age = {}
     cycle = 0
+    logged = {}
     while True:
         signals = {}
         batch_size = max(1, min(100, int(os.getenv("BATCH_SIZE", "80"))))
@@ -246,17 +255,25 @@ def worker():
             hot_watch = list(dict.fromkeys([s for _, s, _ in ranked] + discovered + list(watch_age)))[:20]
         except Exception as exc:
             log.warning("Quote pre-screen unavailable: %s", type(exc).__name__)
-            ranked, screened, discovered = [], set(), []
+            ranked, screened, discovered, pool = [], set(), [], {}
             update(last_quote_error=type(exc).__name__)
         # Stage 2: recheck high-priority names, then fetch completed candles.
         # Keep a small bootstrap watchlist active even before two observations.
         bootstrap = [s.strip().upper() for s in os.getenv("SYMBOLS", "WFF.US,VEEA.US,OFAL.US,MRNA.US").split(",") if s.strip()]
-        targets = list(dict.fromkeys([s for _,s,_ in ranked][:8] + discovered[:8] + [s for s in bootstrap if s in screened]))[:16]
+        targets = list(dict.fromkeys([s for _,s,_ in ranked][:8] + discovered[:8] + hot_watch[:8] + [s for s in bootstrap if s in screened]))[:24]
         for symbol in targets:
             try:
-                one, bar_utc = fetch_completed(ctx, symbol, Period.Min_1, 15)
+                one, bar_utc = fetch_completed(ctx, symbol, Period.Min_1, 20)
                 five, _ = fetch_completed(ctx, symbol, Period.Min_5, 10)
                 signals[symbol] = analyze(one, five)
+                snap = pool.get(symbol)
+                if snap is not None:
+                    previous = float(snap.prev_close)
+                    day_gain = 100 * (float(snap.last_done) / previous - 1) if previous > 0 else None
+                    signals[symbol]["session_gain_pct"] = day_gain
+                    if day_gain is not None and day_gain >= 15:
+                        signals[symbol]["setup_type"] = "continuation"
+                signals[symbol]["bar_utc"] = bar_utc
                 if one:
                     with tracker_lock:
                         tracker.observe(symbol, signals[symbol], one[-1].close, bar_utc)
@@ -267,15 +284,19 @@ def worker():
             tracker.expire()
         # Current candidates expire when no longer seen; avoid a permanently stale count.
         last_candidates = {s: (v, cycle) for s, (v, age) in last_candidates.items() if cycle - age <= 10}
-        last_candidates.update({s: (v, cycle) for s, v in signals.items() if v.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")})
+        last_candidates.update({s: (v, cycle) for s, v in signals.items() if v.get("state") in ("PRE_IGNITION", "EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")})
         if len(last_candidates) > 100:
             last_candidates = dict(list(last_candidates.items())[-100:])
         with tracker_lock:
             lifecycle_snapshot, history_snapshot = tracker.summary(), tracker.recent(30)
         update(discovery_mode="multi_batch_quote_discovery", discovery_batches=discovery_batches, screener_candidates=[], screener_candidate_count=0, screener_last_utc=None, screener_error=None, signal_lifecycle=lifecycle_snapshot, signal_history=history_snapshot, signal_storage="ephemeral_sqlite", signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates={s: v for s, (v, age) in last_candidates.items()}, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
+        log.info("SCANNER HEARTBEAT cycle=%s targets=%s universe=%s progress=%s",
+                 cycle, len(targets), len(symbols), round(100*cursor/len(symbols), 1) if symbols else 0)
         for symbol, result in signals.items():
-            if result.get("state") in ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER"):
+            signature = (result.get("state"), result.get("bar_utc"))
+            if result.get("state") in ("PRE_IGNITION", "EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER") and logged.get(symbol) != signature:
                 log.warning("PROVISIONAL IGNITION %s %s", symbol, result)
+            logged[symbol] = signature
         time.sleep(max(60, int(os.getenv("POLL_SECONDS", "60"))))
 
 def hot_worker():
@@ -294,6 +315,7 @@ def hot_worker():
     history = {}
     streaks = {}
     fast_candidates = {}
+    buildup_candidates = {}
     interval = max(10, min(60, int(os.getenv("HOT_POLL_SECONDS", "15"))))
     while True:
         started = time.monotonic()
@@ -308,6 +330,13 @@ def hot_worker():
                     symbol = str(snap.symbol)
                     price, volume = float(snap.last_done), float(snap.volume)
                     fast_tracker.observe(symbol, price)
+                    quote_time = snap.timestamp
+                    if quote_time.tzinfo is None:
+                        quote_time = quote_time.replace(tzinfo=timezone.utc)
+                    if abs((datetime.now(timezone.utc) - quote_time).total_seconds()) > 60:
+                        history.pop(symbol, None)
+                        streaks.pop(symbol, None)
+                        continue
                     trail = history.setdefault(symbol, deque(maxlen=40))
                     while trail and now - trail[0][0] > 180:
                         trail.popleft()
@@ -317,6 +346,15 @@ def hot_worker():
                         seconds = now - previous[0]
                         change = 100 * (price / previous[1] - 1)
                         vol_delta = max(0, volume - previous[2])
+                        if volume < previous[2]:
+                            trail.clear()
+                            streaks[symbol] = 0
+                            continue
+                        prior_window = next((x for x in reversed(trail) if previous[0] - x[0] >= 10), None)
+                        prior_rate = ((previous[2] - prior_window[2]) / (previous[0] - prior_window[0])) if prior_window and previous[2] >= prior_window[2] else 0
+                        rate = vol_delta / max(seconds, 1)
+                        if prior_rate > 0 and rate >= prior_rate * 1.5 and -0.1 <= change <= 0.25 and vol_delta * price >= 10000:
+                            buildup_candidates[symbol] = {"state": "FAST_BUILDUP_WATCH", "detected_utc": datetime.now(timezone.utc).isoformat(), "price": price, "volume_rate_ratio": round(rate/prior_rate, 2), "provisional": True, "executable": False}
                         momentum_up = change >= 0.25 and vol_delta >= 1000
                         streaks[symbol] = streaks.get(symbol, 0) + 1 if momentum_up else 0
                         if streaks[symbol] == 2:
@@ -332,7 +370,8 @@ def hot_worker():
                 history = {s: h for s, h in history.items() if s in symbols}
                 streaks = {s: n for s, n in streaks.items() if s in symbols}
                 fast_candidates = {s: v for s, v in fast_candidates.items() if s in symbols and (datetime.now(timezone.utc) - datetime.fromisoformat(v["detected_utc"])).total_seconds() < 120 and streaks.get(s, 0) >= 2}
-                update(hot_loop_last_utc=datetime.now(timezone.utc).isoformat(),
+                buildup_candidates = {s: v for s, v in buildup_candidates.items() if s in symbols and (datetime.now(timezone.utc)-datetime.fromisoformat(v["detected_utc"])).total_seconds() < 60}
+                update(buildup_candidates=buildup_candidates.copy(), hot_loop_last_utc=datetime.now(timezone.utc).isoformat(),
                        hot_loop_symbols=len(symbols), hot_loop_metrics=results, fast_candidates=fast_candidates.copy(),
                        fast_candidate_count=len(fast_candidates), fast_signal_summary=fast_tracker.summary(), fast_signal_history=fast_tracker.recent(30), hot_loop_error=None, hot_poll_seconds=interval)
             except Exception as exc:
@@ -346,7 +385,12 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"service": "up"}
+    with lock:
+        stamp = state.get("last_poll_utc")
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(stamp)).total_seconds() if stamp else None
+        return {"service": "up", "scanner_fresh": age is not None and age <= 180,
+                "poll_age_seconds": age, "connected": state.get("connected"),
+                "error": state.get("error")}
 
 @app.get("/status")
 def status():
@@ -378,3 +422,12 @@ def fast_signal_export():
     writer.writeheader()
     writer.writerows(rows)
     return Response(output.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=fast_signals.csv"})
+
+
+@app.get("/observations")
+def observations():
+    tracker = getattr(app.state, "signal_tracker", None)
+    if tracker is None:
+        return JSONResponse({"error": "tracker not initialized"}, status_code=503)
+    with tracker_lock:
+        return {"storage": "ephemeral_sqlite", "observations": tracker.observations(1000)}

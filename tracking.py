@@ -4,10 +4,11 @@ Local SQLite survives process restarts only while the host filesystem persists.
 Render Free storage is ephemeral; export data for durable validation.
 """
 import os
+import json
 import sqlite3
 from datetime import datetime, timezone
 
-ACTIVE = ("EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")
+ACTIVE = ("PRE_IGNITION", "EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")
 
 class SignalTracker:
     def __init__(self, path=None):
@@ -25,6 +26,10 @@ class SignalTracker:
             initial_state TEXT NOT NULL, last_state TEXT NOT NULL,
             last_bar_utc TEXT, observation_count INTEGER NOT NULL DEFAULT 1
         )""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS signal_observations (
+            id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, observed_utc TEXT NOT NULL,
+            bar_utc TEXT, price REAL NOT NULL, metrics_json TEXT NOT NULL,
+            UNIQUE(symbol, bar_utc))""")
         self.db.commit()
 
     def observe(self, symbol, signal, price, bar_utc, now=None):
@@ -33,6 +38,9 @@ class SignalTracker:
         state = signal.get("state", "NO_SIGNAL")
         if not price or price <= 0:
             return
+        self.db.execute("""INSERT OR IGNORE INTO signal_observations
+            (symbol, observed_utc, bar_utc, price, metrics_json) VALUES (?,?,?,?,?)""",
+            (symbol, stamp, bar_utc, price, json.dumps(signal, sort_keys=True)))
         row = self.db.execute(
             "SELECT * FROM signals WHERE symbol=? AND lifecycle='ACTIVE' ORDER BY id DESC LIMIT 1",
             (symbol,)).fetchone()
@@ -40,6 +48,7 @@ class SignalTracker:
         fresh = bool(bar_utc) and (row is None or row["last_bar_utc"] != bar_utc)
         if row is None:
             if state not in ACTIVE or not fresh:
+                self.db.commit()
                 return
             self.db.execute("""INSERT INTO signals
                 (symbol,detected_utc,last_seen_utc,detection_price,last_price,
@@ -76,3 +85,8 @@ class SignalTracker:
     def summary(self):
         rows = self.db.execute("SELECT lifecycle,COUNT(*) AS n FROM signals GROUP BY lifecycle").fetchall()
         return {r["lifecycle"]: r["n"] for r in rows}
+
+
+    def observations(self, limit=1000):
+        rows = self.db.execute("SELECT * FROM signal_observations ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row, metrics=json.loads(row["metrics_json"])) for row in rows]
