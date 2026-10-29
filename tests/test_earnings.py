@@ -20,7 +20,7 @@ def test_parses_and_normalizes_longbridge_us_symbols():
 
 def test_missing_key_means_no_external_calls():
     calendar = EarningsCalendar(api_key="")
-    assert calendar.refresh_if_due(now=NOW, fetcher=lambda: (_ for _ in ()).throw(AssertionError()))
+    assert not calendar.refresh_if_due(now=NOW, fetcher=lambda: (_ for _ in ()).throw(AssertionError()))
     assert calendar.status(now=NOW)["status"] == "disabled_missing_api_key"
 
 
