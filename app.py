@@ -16,6 +16,7 @@ from tracking import SignalTracker
 from fast_tracking import FastTracker
 from discovery import configured_universe, screen_snapshot
 from pipeline import select_candidates, discover_initial, quote_strength
+from earnings import EarningsCalendar
 from scanner_mcp import mcp
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -204,6 +205,8 @@ def worker():
         return
     tracker = SignalTracker()
     app.state.signal_tracker = tracker
+    earnings = EarningsCalendar()
+    app.state.earnings_calendar = earnings
     # Shuffle sweep order to avoid systematically discovering A-tickers first.
     # This improves fairness, not the total time required for a full sweep.
     rng = random.Random()
@@ -217,6 +220,9 @@ def worker():
     cycle = 0
     logged = {}
     while True:
+        # At most one external calendar request every 12 hours; no network
+        # traffic when the optional key is absent. Failure cannot halt scanning.
+        earnings.refresh_if_due()
         signals = {}
         batch_size = max(1, min(100, int(os.getenv("BATCH_SIZE", "80"))))
         discovery_batches = max(1, min(4, int(os.getenv("DISCOVERY_BATCHES", "3"))))
@@ -241,7 +247,12 @@ def worker():
                     time.sleep(0.4)
             # Stage 1: cheap quote snapshots; candle requests are only for
             # candidates showing *new* volume and positive price acceleration.
-            ranked = select_candidates(snapshots, quote_history, screen_snapshot, limit=12)
+            ranked = select_candidates(snapshots, quote_history, screen_snapshot,
+                                       limit=12, catalyst_bonus=earnings.bonus)
+            for _, symbol, details in ranked:
+                event = earnings.get(symbol)
+                if event:
+                    details["earnings"] = event
             discovered = discover_initial(snapshots, screen_snapshot, limit=16)
             priority = list(dict.fromkeys([s for _, s, _ in ranked] + discovered))[:24]
             screened = {str(s.symbol) for s in snapshots if screen_snapshot(s)}
@@ -274,6 +285,9 @@ def worker():
                     if day_gain is not None and day_gain >= 15:
                         signals[symbol]["setup_type"] = "continuation"
                 signals[symbol]["bar_utc"] = bar_utc
+                event = earnings.get(symbol)
+                if event:
+                    signals[symbol]["earnings"] = event
                 if one:
                     with tracker_lock:
                         tracker.observe(symbol, signals[symbol], one[-1].close, bar_utc)
@@ -289,7 +303,7 @@ def worker():
             last_candidates = dict(list(last_candidates.items())[-100:])
         with tracker_lock:
             lifecycle_snapshot, history_snapshot = tracker.summary(), tracker.recent(30)
-        update(discovery_mode="multi_batch_quote_discovery", discovery_batches=discovery_batches, screener_candidates=[], screener_candidate_count=0, screener_last_utc=None, screener_error=None, signal_lifecycle=lifecycle_snapshot, signal_history=history_snapshot, signal_storage="ephemeral_sqlite", signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates={s: v for s, (v, age) in last_candidates.items()}, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
+        update(earnings_calendar=earnings.status(), discovery_mode="multi_batch_quote_discovery", discovery_batches=discovery_batches, screener_candidates=[], screener_candidate_count=0, screener_last_utc=None, screener_error=None, signal_lifecycle=lifecycle_snapshot, signal_history=history_snapshot, signal_storage="ephemeral_sqlite", signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates={s: v for s, (v, age) in last_candidates.items()}, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
         log.info("SCANNER HEARTBEAT cycle=%s targets=%s universe=%s progress=%s",
                  cycle, len(targets), len(symbols), round(100*cursor/len(symbols), 1) if symbols else 0)
         for symbol, result in signals.items():
@@ -355,12 +369,20 @@ def hot_worker():
                         rate = vol_delta / max(seconds, 1)
                         if prior_rate > 0 and rate >= prior_rate * 1.5 and -0.1 <= change <= 0.25 and vol_delta * price >= 10000:
                             buildup_candidates[symbol] = {"state": "FAST_BUILDUP_WATCH", "detected_utc": datetime.now(timezone.utc).isoformat(), "price": price, "volume_rate_ratio": round(rate/prior_rate, 2), "provisional": True, "executable": False}
+                            calendar = getattr(app.state, "earnings_calendar", None)
+                            event = calendar.get(symbol) if calendar else None
+                            if event:
+                                buildup_candidates[symbol]["earnings"] = event
                         momentum_up = change >= 0.25 and vol_delta >= 1000
                         streaks[symbol] = streaks.get(symbol, 0) + 1 if momentum_up else 0
                         if streaks[symbol] == 2:
                             fast_tracker.detect(symbol, price)
                         if streaks[symbol] >= 2:
                             fast_candidates[symbol] = {"state": "FAST_MOMENTUM_CANDIDATE", "detected_utc": datetime.now(timezone.utc).isoformat(), "price": price, "price_change_pct": round(change, 3), "volume_delta": vol_delta, "provisional": True, "executable": False}
+                            calendar = getattr(app.state, "earnings_calendar", None)
+                            event = calendar.get(symbol) if calendar else None
+                            if event:
+                                fast_candidates[symbol]["earnings"] = event
                         results[symbol] = {"price_change_pct": round(change, 3),
                                            "volume_delta": vol_delta,
                                            "window_seconds": round(seconds, 1),
@@ -396,6 +418,24 @@ def health():
 def status():
     with lock:
         return dict(state)
+
+@app.get("/earnings")
+def earnings_context():
+    """Read-only earnings intelligence for the active hot-watch subset."""
+    calendar = getattr(app.state, "earnings_calendar", None)
+    if calendar is None:
+        return {"status": {"status": "initializing"}, "watchlist": {}}
+    with lock:
+        symbols = list(dict.fromkeys(
+            list(state.get("hot_watch", [])) + list(state.get("fast_candidates", {}))
+        ))[:30]
+    watchlist = {}
+    for symbol in symbols:
+        event = calendar.get(symbol)
+        if event:
+            watchlist[symbol] = event
+    return {"status": calendar.status(), "watchlist": watchlist}
+
 
 @app.get("/signals.csv")
 def signal_export():
