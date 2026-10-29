@@ -28,3 +28,21 @@ def get_signal_history(limit: int = 100) -> dict:
     fast = getattr(app.state, "fast_tracker", None)
     return {"signals": normal.recent(n) if normal else [],
             "fast_signals": fast.recent(n) if fast else []}
+
+@mcp.tool()
+def get_earnings_watchlist() -> dict:
+    """Cached earnings windows for actively monitored symbols; never an earnings beat claim."""
+    from app import app, state, lock
+    calendar = getattr(app.state, "earnings_calendar", None)
+    if calendar is None:
+        return {"status": {"status": "initializing"}, "watchlist": {}}
+    with lock:
+        symbols = list(dict.fromkeys(
+            list(state.get("hot_watch", [])) + list(state.get("fast_candidates", {}))
+        ))[:30]
+    events = {}
+    for symbol in symbols:
+        event = calendar.get(symbol)
+        if event:
+            events[symbol] = event
+    return {"status": calendar.status(), "watchlist": events}
