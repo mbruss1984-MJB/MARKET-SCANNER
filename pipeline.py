@@ -17,7 +17,7 @@ def quote_strength(quote):
     participation = min(10, max(0, turnover / 1_000_000))
     return max(-20, min(30, change)) * 3 + participation
 
-def select_candidates(snapshots, history, screen, limit=12, now=None):
+def select_candidates(snapshots, history, screen, limit=12, now=None, catalyst_bonus=None):
     now = datetime.now(timezone.utc).timestamp() if now is None else now
     ranked = []
     rates = history.setdefault("__rates__", {})
@@ -45,9 +45,19 @@ def select_candidates(snapshots, history, screen, limit=12, now=None):
         buildup = (old_rate is not None and old_rate > 0 and velocity >= old_rate * 1.5
                    and -0.1 <= price_pct < 0.1 and volume_delta * price >= 10000)
         if (price_pct >= 0.1 and volume_delta > 0) or buildup:
-            score = price_pct * 8 + min(velocity / 100, 20) + (5 if buildup else 0)
+            # Catalyst context can only re-rank a quote that independently
+            # passed the original measured acceleration/buildup gate.
+            # An earnings date NEVER creates a momentum signal by itself.
+            bonus = 0.0
+            if catalyst_bonus:
+                try:
+                    bonus = min(10.0, max(0.0, float(catalyst_bonus(symbol))))
+                except (TypeError, ValueError):
+                    bonus = 0.0
+            score = price_pct * 8 + min(velocity / 100, 20) + (5 if buildup else 0) + bonus
             ranked.append((score, symbol, {"price_change_since_seen_pct":round(price_pct, 3),
-                "buildup_candidate": buildup, "volume_since_seen":int(volume_delta), "volume_per_second":round(velocity, 2)}))
+                "buildup_candidate": buildup, "volume_since_seen":int(volume_delta),
+                "volume_per_second":round(velocity, 2), "catalyst_priority_bonus": bonus}))
     ranked.sort(reverse=True)
     return ranked[:limit]
 
