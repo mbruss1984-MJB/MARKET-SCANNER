@@ -53,11 +53,13 @@ def configured_universe():
     except Exception:
         return fallback, "configured_fallback"
 
-def screen_snapshot(snapshot, *, min_price=0.0, min_turnover=100000):
+def screen_snapshot(snapshot, *, min_price=0.0, min_turnover=20000):
     try:
         last = float(snapshot.last_done)
         volume = float(snapshot.volume)
         turnover = float(snapshot.turnover)
+        # This is a discovery liquidity floor, not an entry-quality decision.
+        # Lower-turnover stocks must remain visible to the broader momentum pipeline.
         return last > min_price and volume > 0 and turnover >= min_turnover
     except (AttributeError, TypeError, ValueError):
         return False
