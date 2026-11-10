@@ -11,12 +11,15 @@ class Bar:
     volume: float
 
 def analyze(one_minute: list[Bar], five_minute: list[Bar]) -> dict:
-    """Bars must be completed and ordered oldest first. At least 7 of each."""
-    if len(one_minute) < 7 or len(five_minute) < 7:
-        return {"state": "INSUFFICIENT_DATA", "reason": "Need 7 completed bars of each timeframe"}
+    """Use completed bars only. Seven 1m bars and three 5m bars allow early detection."""
+    if len(one_minute) < 7 or len(five_minute) < 3:
+        return {"state": "INSUFFICIENT_DATA", "reason": "Need 7 completed 1m bars and 3 completed 5m bars"}
     a, b = one_minute[-1], five_minute[-1]
     v1 = median(x.volume for x in one_minute[-7:-1])
-    v5 = median(x.volume for x in five_minute[-7:-1])
+    # Compare with up to six *prior* completed 5m candles. At the open,
+    # two prior bars suffice to avoid waiting 35 minutes for seven candles.
+    prior_five = five_minute[-7:-1]
+    v5 = median(x.volume for x in prior_five)
     r1 = a.volume / v1 if v1 > 0 else None
     r5 = b.volume / v5 if v5 > 0 else None
     p1 = 100 * (a.close / a.open - 1) if a.open > 0 else 0
@@ -24,6 +27,8 @@ def analyze(one_minute: list[Bar], five_minute: list[Bar]) -> dict:
     p15 = 100 * (b.close / five_minute[-3].open - 1) if five_minute[-3].open > 0 else 0
     early = (r1 is not None and r1 >= 4 and p1 >= 0.5)
     confirmed = early and (r5 is not None and r5 >= 4 and p15 >= 0.25)
+    volume_watch_2x = r5 is not None and r5 >= 2 and p5 >= 0.25
+    volume_ignition_4x = r5 is not None and r5 >= 4 and p5 >= 0.25 and p15 >= 0.4
     # Buildup is a research alert, not an order: rising participation before 4x.
     recent = one_minute[-3:]
     baseline = mean(x.volume for x in one_minute[-9:-3]) if len(one_minute) >= 9 else 0
@@ -48,8 +53,15 @@ def analyze(one_minute: list[Bar], five_minute: list[Bar]) -> dict:
            and dollar_volume >= 10000 and rising_volume
            and above_vwap and (compression or higher_lows or reclaim)
            and a.close <= resistance * 1.005 and risk > 0)
-    state = "CONFIRMED_STARTER" if confirmed else "EARLY_STARTER_CANDIDATE" if early else "PRE_IGNITION" if pre else "WATCH" if ((r5 or 0) >= 2 and p5 > 0) else "NO_SIGNAL"
+    state = ("CONFIRMED_STARTER" if confirmed else
+             "EARLY_STARTER_CANDIDATE" if early else
+             "VOLUME_IGNITION_4X" if volume_ignition_4x else
+             "EARLY_VOLUME_WATCH_2X" if volume_watch_2x else
+             "PRE_IGNITION" if pre else
+             "WATCH" if ((r5 or 0) >= 2 and p5 > 0) else "NO_SIGNAL")
     return {"state": state,
+            "discovery_tier": "IGNITION_4X" if volume_ignition_4x else "EARLY_WATCH_2X" if volume_watch_2x else None,
+            "five_minute_baseline_bars": len(prior_five),
             "buildup_volume_ratio": round(buildup_ratio, 3) if buildup_ratio is not None else None,
             "dollar_volume_3m": round(dollar_volume, 2),
             "compression": compression, "higher_lows": higher_lows,
