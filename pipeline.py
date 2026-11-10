@@ -7,11 +7,14 @@ def _float(value, default=0):
     except (TypeError, ValueError):
         return default
 
-def quote_strength(quote):
-    """Same-day change is a discovery hint, not evidence of fresh ignition."""
+def day_gain_pct(quote):
     last = _float(getattr(quote, "last_done", 0))
     previous = _float(getattr(quote, "prev_close", 0))
-    change = 100 * (last / previous - 1) if previous > 0 else 0
+    return 100 * (last / previous - 1) if previous > 0 and last > 0 else 0
+
+def quote_strength(quote):
+    """Same-day change is a discovery hint, not evidence of fresh ignition."""
+    change = day_gain_pct(quote)
     turnover = _float(getattr(quote, "turnover", 0))
     # Favor meaningful upside and participation; cap large-cap turnover advantage.
     participation = min(10, max(0, turnover / 1_000_000))
@@ -42,23 +45,40 @@ def select_candidates(snapshots, history, screen, limit=12, now=None):
         velocity = volume_delta / max(1, elapsed)
         old_rate = rates.get(symbol)
         rates[symbol] = velocity
+        volume_acceleration = old_rate is not None and old_rate > 0 and velocity >= old_rate * 2
         buildup = (old_rate is not None and old_rate > 0 and velocity >= old_rate * 1.5
                    and -0.1 <= price_pct < 0.1 and volume_delta * price >= 10000)
-        if (price_pct >= 0.1 and volume_delta > 0) or buildup:
-            score = price_pct * 8 + min(velocity / 100, 20) + (5 if buildup else 0)
+        early_acceleration = (volume_acceleration and price_pct >= 0.05
+                              and volume_delta * price >= 10000)
+        if (price_pct >= 0.1 and volume_delta > 0) or buildup or early_acceleration:
+            score = price_pct * 8 + min(velocity / 100, 20) + (5 if buildup else 0) + (8 if early_acceleration else 0)
             ranked.append((score, symbol, {"price_change_since_seen_pct":round(price_pct, 3),
-                "buildup_candidate": buildup, "volume_since_seen":int(volume_delta), "volume_per_second":round(velocity, 2)}))
+                "buildup_candidate": buildup, "early_acceleration_2x": early_acceleration,
+                "volume_acceleration_ratio": round(velocity / old_rate, 2) if old_rate and old_rate > 0 else None,
+                "volume_since_seen":int(volume_delta), "volume_per_second":round(velocity, 2)}))
     ranked.sort(reverse=True)
     return ranked[:limit]
 
 def discover_initial(snapshots, screen, limit=16):
-    """Provisional day-mover discovery even on first encounter."""
-    candidates = [q for q in snapshots if screen(q) and quote_strength(q) >= 6]
-    candidates.sort(key=quote_strength, reverse=True)
-    # Reserve discovery capacity for liquid, quiet names before a day-mover jump.
-    quiet = [q for q in snapshots if screen(q) and q not in candidates]
-    quiet.sort(key=lambda q: _float(getattr(q, "turnover", 0)), reverse=True)
-    mover_slots = max(1, limit * 3 // 4)
-    selected = candidates[:mover_slots] + quiet[:max(0, limit-len(candidates[:mover_slots]))]
-    return [str(q.symbol) for q in selected]
+    """Select market-wide first sightings before they become fully extended.
 
+    Reserve slots for early +0.5%-to-2% gainers and still-quiet names.
+    This is discovery only: spread, float, catalyst, and VWAP are later gates.
+    There is deliberately no upper gain ceiling on discovery.
+    """
+    eligible = [q for q in snapshots if screen(q)]
+    movers = [q for q in eligible if day_gain_pct(q) >= 2]
+    early = [q for q in eligible if 0.5 <= day_gain_pct(q) < 2]
+    quiet = [q for q in eligible if day_gain_pct(q) < 0.5]
+    movers.sort(key=quote_strength, reverse=True)
+    early.sort(key=lambda q: (day_gain_pct(q), _float(getattr(q, "turnover", 0))), reverse=True)
+    quiet.sort(key=lambda q: (day_gain_pct(q), min(_float(getattr(q, "turnover", 0)), 1_000_000)), reverse=True)
+    # Avoid a crowded already-rallied bucket consuming the entire hot-watch queue.
+    mover_slots = max(1, limit * 3 // 8)
+    early_slots = max(1, limit * 3 // 8)
+    quiet_slots = max(1, limit - mover_slots - early_slots)
+    selected = movers[:mover_slots] + early[:early_slots] + quiet[:quiet_slots]
+    # Fill unused slots, preserving each symbol only once.
+    selected += [q for q in movers[mover_slots:] + early[early_slots:] + quiet[quiet_slots:]
+                 if q not in selected][:max(0, limit - len(selected))]
+    return [str(q.symbol) for q in selected[:limit]]
