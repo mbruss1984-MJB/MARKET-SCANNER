@@ -18,6 +18,10 @@ from discovery import configured_universe, screen_snapshot
 from pipeline import select_candidates, discover_initial, quote_strength
 from scanner_mcp import mcp
 
+ACTIVE_SIGNAL_STATES = ("PRE_IGNITION", "EARLY_STARTER_CANDIDATE",
+                        "CONFIRMED_STARTER", "EARLY_VOLUME_WATCH_2X",
+                        "VOLUME_IGNITION_4X")
+
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("ignition")
 @asynccontextmanager
@@ -282,19 +286,24 @@ def worker():
                 signals[symbol] = {"state": "DATA_ERROR", "error_type": type(exc).__name__}
         with tracker_lock:
             tracker.expire()
+        # Feed any newly discovered 2x/4x volume signals into the independent
+        # hot loop. They are provisional research candidates, not buy signals.
+        newly_active = [symbol for symbol, result in signals.items()
+                        if result.get("state") in ACTIVE_SIGNAL_STATES]
+        hot_watch = list(dict.fromkeys(newly_active + hot_watch))[:20]
         # Current candidates expire when no longer seen; avoid a permanently stale count.
         last_candidates = {s: (v, cycle) for s, (v, age) in last_candidates.items() if cycle - age <= 10}
-        last_candidates.update({s: (v, cycle) for s, v in signals.items() if v.get("state") in ("PRE_IGNITION", "EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")})
+        last_candidates.update({s: (v, cycle) for s, v in signals.items() if v.get("state") in ACTIVE_SIGNAL_STATES})
         if len(last_candidates) > 100:
             last_candidates = dict(list(last_candidates.items())[-100:])
         with tracker_lock:
             lifecycle_snapshot, history_snapshot = tracker.summary(), tracker.recent(30)
-        update(discovery_mode="multi_batch_quote_discovery", discovery_batches=discovery_batches, screener_candidates=[], screener_candidate_count=0, screener_last_utc=None, screener_error=None, signal_lifecycle=lifecycle_snapshot, signal_history=history_snapshot, signal_storage="ephemeral_sqlite", signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), recent_candidates={s: v for s, (v, age) in last_candidates.items()}, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
+        update(discovery_mode="multi_batch_quote_discovery", discovery_batches=discovery_batches, screener_candidates=[], screener_candidate_count=0, screener_last_utc=None, screener_error=None, signal_lifecycle=lifecycle_snapshot, signal_history=history_snapshot, signal_storage="ephemeral_sqlite", signals=signals, last_poll_utc=datetime.now(timezone.utc).isoformat(), scanned_batch=batch, universe_size=len(symbols), candidate_count=len(last_candidates), early_volume_watch_count=sum(v.get("state") == "EARLY_VOLUME_WATCH_2X" for v in signals.values()), volume_ignition_count=sum(v.get("state") == "VOLUME_IGNITION_4X" for v in signals.values()), recent_candidates={s: v for s, (v, age) in last_candidates.items()}, quote_candidates=[{"symbol": s, "score": round(score,2), **details} for score,s,details in ranked], candle_targets=targets, quote_history_size=len(quote_history), discovered_day_movers=discovered, hot_watch=hot_watch, quote_batch_size=len(quote_batch), sweep_progress_pct=round(100*cursor/len(symbols),1) if symbols else 0, cycle=cycle)
         log.info("SCANNER HEARTBEAT cycle=%s targets=%s universe=%s progress=%s",
                  cycle, len(targets), len(symbols), round(100*cursor/len(symbols), 1) if symbols else 0)
         for symbol, result in signals.items():
             signature = (result.get("state"), result.get("bar_utc"))
-            if result.get("state") in ("PRE_IGNITION", "EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER") and logged.get(symbol) != signature:
+            if result.get("state") in ACTIVE_SIGNAL_STATES and logged.get(symbol) != signature:
                 log.warning("PROVISIONAL IGNITION %s %s", symbol, result)
             logged[symbol] = signature
         time.sleep(max(60, int(os.getenv("POLL_SECONDS", "60"))))

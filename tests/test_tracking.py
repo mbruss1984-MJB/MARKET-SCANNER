@@ -27,3 +27,8 @@ def test_no_signal_does_not_create_entry(tmp_path):
     tracker = SignalTracker(str(tmp_path / "signals.db"))
     tracker.observe("TEST.US", {"state": "NO_SIGNAL"}, 5, "bar-1")
     assert tracker.recent() == []
+
+def test_market_wide_early_2x_is_tracked(tmp_path):
+    tracker = SignalTracker(str(tmp_path / "early.db"))
+    tracker.observe("AMIX.US", {"state": "EARLY_VOLUME_WATCH_2X"}, 2.10, "bar-1")
+    assert tracker.summary() == {"ACTIVE": 1}

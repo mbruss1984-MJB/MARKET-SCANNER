@@ -8,7 +8,8 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-ACTIVE = ("PRE_IGNITION", "EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER")
+ACTIVE = ("PRE_IGNITION", "EARLY_STARTER_CANDIDATE", "CONFIRMED_STARTER",
+          "EARLY_VOLUME_WATCH_2X", "VOLUME_IGNITION_4X")
 
 class SignalTracker:
     def __init__(self, path=None):

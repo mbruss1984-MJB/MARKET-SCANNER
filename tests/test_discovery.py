@@ -26,3 +26,8 @@ def test_security_classes_excluded():
 def test_no_unintended_price_floor():
     q = SimpleNamespace(last_done="0.39", volume=300000, turnover=117000)
     assert screen_snapshot(q)
+
+def test_early_low_turnover_is_discoverable():
+    q = SimpleNamespace(last_done="1.20", volume=17000, turnover=20400)
+    assert screen_snapshot(q)
+    assert not screen_snapshot(SimpleNamespace(last_done="1.20", volume=100, turnover=120))
