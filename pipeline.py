@@ -16,9 +16,12 @@ def quote_strength(quote):
     """Same-day change is a discovery hint, not evidence of fresh ignition."""
     change = day_gain_pct(quote)
     turnover = _float(getattr(quote, "turnover", 0))
-    # Favor meaningful upside and participation; cap large-cap turnover advantage.
+    # Prefer emerging 0.5%-8% moves rather than ranking 30%-100% spikes
+    # at the top of discovery just because of their existing daily gains.
     participation = min(10, max(0, turnover / 1_000_000))
-    return max(-20, min(30, change)) * 3 + participation
+    emerging = max(-20, min(8, change)) * 3
+    extension_penalty = max(0, change - 8) * 4
+    return emerging + participation - extension_penalty
 
 def select_candidates(snapshots, history, screen, limit=12, now=None):
     now = datetime.now(timezone.utc).timestamp() if now is None else now
@@ -50,7 +53,10 @@ def select_candidates(snapshots, history, screen, limit=12, now=None):
                    and -0.1 <= price_pct < 0.1 and volume_delta * price >= 10000)
         early_acceleration = (volume_acceleration and price_pct >= 0.05
                               and volume_delta * price >= 10000)
-        if (price_pct >= 0.1 and volume_delta > 0) or buildup or early_acceleration:
+        # A single tiny print can move an illiquid quote; require notional
+        # turnover for an ordinary positive-price discovery event.
+        price_move_candidate = (0.1 <= price_pct <= 3.0 and volume_delta * price >= 5000)
+        if price_move_candidate or buildup or early_acceleration:
             score = price_pct * 8 + min(velocity / 100, 20) + (5 if buildup else 0) + (8 if early_acceleration else 0)
             ranked.append((score, symbol, {"price_change_since_seen_pct":round(price_pct, 3),
                 "buildup_candidate": buildup, "early_acceleration_2x": early_acceleration,
