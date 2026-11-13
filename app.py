@@ -184,7 +184,7 @@ def fetch_completed(ctx, symbol, period, count):
             timestamps.append(ts.astimezone(timezone.utc))
             last_bar_utc = ts.astimezone(timezone.utc).isoformat()
     # Do not infer fresh ignition from yesterday or gaps between sessions.
-    if not timestamps or (now - timestamps[-1]).total_seconds() > minutes * 180:
+    if not timestamps or (now - timestamps[-1]).total_seconds() > minutes * 60 * 2 + 30:
         return [], None
     start = len(timestamps) - 1
     while start > 0 and (timestamps[start] - timestamps[start-1]).total_seconds() == minutes * 60:
@@ -277,6 +277,13 @@ def worker():
                     signals[symbol]["session_gain_pct"] = day_gain
                     if day_gain is not None and day_gain >= 15:
                         signals[symbol]["setup_type"] = "continuation"
+                    # Still discover extended movers, but never promote their
+                    # first ignition print as a qualified entry alert.
+                    if day_gain is not None and day_gain >= 25:
+                        signals[symbol]["extension_warning"] = "session_up_25pct"
+                        if signals[symbol].get("state") in ACTIVE_SIGNAL_STATES:
+                            signals[symbol]["state"] = "EXTENDED_WATCH"
+                            signals[symbol]["reason"] = "Session extension >=25%; wait for consolidation and a fresh base"
                 signals[symbol]["bar_utc"] = bar_utc
                 if one:
                     with tracker_lock:
