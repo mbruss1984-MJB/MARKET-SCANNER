@@ -19,7 +19,7 @@ def analyze(one_minute: list[Bar], five_minute: list[Bar]) -> dict:
     # Compare with up to six *prior* completed 5m candles. At the open,
     # two prior bars suffice to avoid waiting 35 minutes for seven candles.
     prior_five = five_minute[-7:-1]
-    v5 = median(x.volume for x in prior_five)
+    v5 = median(x.volume for x in prior_five) if prior_five else 0
     r1 = a.volume / v1 if v1 > 0 else None
     r5 = b.volume / v5 if v5 > 0 else None
     p1 = 100 * (a.close / a.open - 1) if a.open > 0 else 0
