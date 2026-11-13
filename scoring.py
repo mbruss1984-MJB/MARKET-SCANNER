@@ -11,7 +11,7 @@ class Bar:
     volume: float
 
 def analyze(one_minute: list[Bar], five_minute: list[Bar]) -> dict:
-    """Use completed bars only. Seven 1m bars and three 5m bars allow early detection."""
+    """Use completed bars only; qualify early 1m strength without waiting 15m."""
     if len(one_minute) < 7 or len(five_minute) < 1:
         return {"state": "INSUFFICIENT_DATA", "reason": "Need 7 completed 1m bars and at least 1 completed 5m bar"}
     a, b = one_minute[-1], five_minute[-1]
@@ -64,6 +64,10 @@ def analyze(one_minute: list[Bar], five_minute: list[Bar]) -> dict:
     quality_rejections = []
     if not higher_lows or not higher_closes:
         quality_rejections.append("price_lows_or_closes_not_rising")
+    if recent[-1].close < recent[0].close * 1.0015:
+        quality_rejections.append("no_sustained_3min_price_gain")
+    if r1 is None or r1 < 1.25:
+        quality_rejections.append("one_minute_volume_not_expanding")
     if a.close < a.open:
         quality_rejections.append("last_minute_selling")
     if not above_vwap:
